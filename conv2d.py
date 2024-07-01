@@ -81,22 +81,23 @@ if __name__ == "__main__":
     C_in, C_out = 3, 1
     model = NittaConv2d(C_in, C_out, kernel_size=2)
     print(model(img)[0, :, :, 0])
+    """
 
     # compare out 1
-    m1 = nn.Conv2d(3, 10, (3, 5), stride=(2, 1), padding=(4, 2))
-    m2 = NittaConv2d(3, 10, (3, 5), stride=(2, 1), padding=(4, 2))
+    conv1 = nn.Conv2d(3, 10, (3, 5), stride=(2, 1), padding=(4, 2))
+    conv2 = NittaConv2d(3, 10, (3, 5), stride=(2, 1), padding=(4, 2))
     weight = torch.arange(0, 450).reshape(10, 3, 3, 5).to(torch.float32).requires_grad_(True)
     bias = torch.arange(0, 10).to(torch.float32).requires_grad_(True)
-    m1.weight = nn.Parameter(weight)
-    m1.bias = nn.Parameter(bias)
-    m2.weight = nn.Parameter(weight)
-    m2.bias = nn.Parameter(bias)
+    conv1.weight = nn.Parameter(weight)
+    conv1.bias = nn.Parameter(bias)
+    conv2.weight = nn.Parameter(weight)
+    conv2.bias = nn.Parameter(bias)
     img = torch.arange(0, 300).reshape(1, 3, 10, 10).to(torch.float32)
-    # print(m1(img).shape)
-    # print(m1(img)[0, 0, 1, 1])
-    # print(m2(img)[0, 0, 1, 1])
-    # print((m1(img) - m2(img))[0, 0, :, :])
-    print((m1(img) == m2(img)))
+    # print(conv1(img).shape)
+    # print(conv1(img)[0, 0, 1, 1])
+    # print(conv2(img)[0, 0, 1, 1])
+    # print((conv1(img) - conv2(img))[0, 0, :, :])
+    print((torch.sum(conv1(img) == conv2(img))))
 
     # compare out 2
     C_in = 16
@@ -104,27 +105,40 @@ if __name__ == "__main__":
     kernel_size = (3, 5)
     stride = (2, 1)
     padding = (4, 2)
-    m1 = NittaConv2d(C_in, C_out, kernel_size, stride=stride, padding=padding)
-    m2 = nn.Conv2d(C_in, C_out, kernel_size, stride=stride, padding=padding)
+    conv1 = NittaConv2d(C_in, C_out, kernel_size, stride=stride, padding=padding)
+    conv2 = nn.Conv2d(C_in, C_out, kernel_size, stride=stride, padding=padding)
     N = C_out * C_in * kernel_size[0] * kernel_size[1]
     weight = torch.arange(0, N).reshape(C_out, C_in, *kernel_size).to(torch.float32).requires_grad_(True)
     weight = nn.Parameter(weight)
     bias = torch.arange(C_out).to(torch.float32).requires_grad_(True)
     bias = nn.Parameter(bias)
-    m1.weight = weight
-    m2.weight = weight
-    m1.bias = bias
-    m2.bias = bias
+    conv1.weight = weight
+    conv2.weight = weight
+    conv1.bias = bias
+    conv2.bias = bias
     N = C_in * 10 * 10
     img = torch.arange(0, N).reshape(1, C_in, 10, 10).to(torch.float32).requires_grad_(True)
-    # print(m1(img)[0, 0, :, :])
-    # print(m2(img)[0, 0, :, :])
-    # print(m1(img).shape)
-    # print(m2(img).shape)
-    # print(m1(img) == m2(img))
-    idx = (m1(img) != m2(img))
-    d1 = m1(img)[idx]
-    d2 = m2(img)[idx]
+    label = torch.randn(1, C_out, 8, 10)
+    # print(conv1(img)[0, 0, :, :])
+    # print(conv2(img)[0, 0, :, :])
+    # print(conv1(img).shape)
+    # print(conv2(img).shape)
+    # print(conv1(img) == conv2(img))
+    """
+    idx = (conv1(img) != conv2(img))
+    d1 = conv1(img)[idx]
+    d2 = conv2(img)[idx]
     for i in range(len(d1)):
         print(d1[i], d2[i], d1[i] - d2[i])
     """
+
+    criterion = nn.CrossEntropyLoss()
+    out1 = conv1(img)
+    # print(out1.shape)
+    loss1 = criterion(out1, label)
+    loss1.backward()
+    print(conv1.weight.grad[0, 0, :, :])
+    out2 = conv2(img)
+    loss2 = criterion(out2, label)
+    loss2.backward()
+    print(conv2.weight.grad[0, 0, :, :] / 2)
