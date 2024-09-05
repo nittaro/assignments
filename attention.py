@@ -12,24 +12,21 @@ class NittaMHA(nn.Module):
         self.dropout = dropout
         d_k = embed_dim // num_heads
         self.d_k = d_k
-        self.input_pj_layers_q = []
-        self.input_pj_layers_k = []
-        self.input_pj_layers_v = []
-        for i in range(num_heads):
-            self.input_pj_layers_q.append(nn.Linear(embed_dim, d_k, bias=bias))
-            self.input_pj_layers_k.append(nn.Linear(embed_dim, d_k, bias=bias))
-            self.input_pj_layers_v.append(nn.Linear(embed_dim, d_k, bias=bias))
-        self.output_pj_layer = nn.Linear(d_k, embed_dim, bias=bias)
+        self.input_pj_q = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.input_pj_k = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.input_pj_v = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.output_pj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
     def forward(self, Q, K, V):
         attns = []
-        for i in range(self.num_heads):
-            q_m = self.input_pj_layers_q[i](Q)
-            k_m = self.input_pj_layers_k[i](K)
-            v_m = self.input_pj_layers_v[i](V)
-            attns.append(SDA(q_m, k_m, v_m, dropout_p=self.dropout))
+        qs = torch.chunk(self.input_pj_q(Q), self.num_heads, dim=-1)
+        ks = torch.chunk(self.input_pj_k(K), self.num_heads, dim=-1)
+        vs = torch.chunk(self.input_pj_v(V), self.num_heads, dim=-1)
+        for (q, k, v) in zip(qs, ks, vs):
+            attns.append(SDA(q, k, v, dropout_p=self.dropout))
         attns = torch.cat(attns, dim=-1)
-        return self.output_pj_layer(attns)
+        
+        return self.output_pj(attns)
 
 def SDA(Q, K, V, mask=None, dropout_p=None):
     d = Q.size(-1)
@@ -37,7 +34,7 @@ def SDA(Q, K, V, mask=None, dropout_p=None):
     attn_weight = Q @ K.transpose(-1, -2) * scale
     if mask is not None:
         if mask.dtype == torch.bool:
-            attn_weight.masked_fill_(mask, 0)
+            attn_weight.masked_fill_(mask.logical_not(), float("-inf"))
         else:
             attn_weight += mask
     attn_weight = F.softmax(attn_weight, dim=-1)
