@@ -83,7 +83,7 @@ class PPEG(nn.Module):
         N_sqrt = int(sqrt(N))
         assert N_sqrt * N_sqrt == N
 
-        H_c = torch.unsqueeze(x[:, 0, :], dim=0) # (B, 1, D)
+        H_c = x[:, :1, :] # (B, 1, D)
         H_f = x[:, 1:, :] # (B, N, D)
         H_f = torch.reshape(H_f, (-1, N_sqrt, N_sqrt, self.embed_dim))
         H_f = torch.permute(H_f, (0, 3, 1, 2)) # (B, D, N_sqrt, N_sqrt)
@@ -152,8 +152,10 @@ class TransMIL(nn.Module):
             H = self.resnet(x) # (B * N, D)
             H = torch.reshape(H, (B, n, -1))
 
+        # squaring of sequence
         H_s = torch.cat((self.cls_token.repeat(repeats=(B, 1, 1)), H, H[:, :M, :]), dim=1)
 
+        # TPT module processing
         H_s = self.encoder(H_s)
 
         # MLP
