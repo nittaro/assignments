@@ -56,6 +56,7 @@ class ModifiedMSA(nn.Module):
             K_l = K[:, :, num_k*segs:, :].reshape(batch_size, self.num_heads, r, segs+1, self.head_dim).mean(-2)
             K_tilde = torch.concat((K_f, K_l), dim=-2)
 
+        # Nyström approximation
         kernel1 = F.softmax(torch.matmul(Q, K_tilde.transpose(-1, -2)), dim=-1)
         kernel2 = F.softmax(torch.matmul(Q_tilde, K_tilde.transpose(-1, -2)), dim=-1)
         kernel3 = F.softmax(torch.matmul(Q_tilde, K.transpose(-1, -2)), dim=-1)
@@ -182,7 +183,7 @@ if __name__ == "__main__":
     """
 
     """
-    # test code for Nystrom approximation
+    # test code for Nyström approximation
     msa = ModifiedMSA(embed_dim, num_heads)
     x = torch.rand(1, 256, 1000)
     out = msa(x)
