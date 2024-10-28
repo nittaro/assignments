@@ -16,9 +16,10 @@ class AttentionBasedMILPooling(nn.Module):
         )
 
     def forward(self, x):
-        attn_w = F.softmax(self.fc(x), dim=0)
-        out = attn_w.T @ x
-        return out
+        # (batch_size, num_instances, feature_dim)
+        attn_w = torch.transpose(F.softmax(self.fc(x), dim=1), -1, -2) # (batch_size, 1, num_instances)
+        out = attn_w @ x # (batch_size, 1, feature_dim)
+        return out.squeeze(1)
 
 class GatedAttentionBasedMILPooling(nn.Module):
     def __init__(self, input_dim, hidden_dim):
@@ -37,18 +38,19 @@ class GatedAttentionBasedMILPooling(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, 1)
 
     def forward(self, x):
+        # (batch_size, num_instances, feature_dim)
         h = self.fc1(x) * self.gate(x)
         h = self.fc2(h)
-        attn_w = F.softmax(h, dim=0)
-        out = attn_w.T @ x
-        return out
+        attn_w = torch.transpose(F.softmax(h, dim=1), -1, -2) # (batch_size, 1, num_instances)
+        out = attn_w @ x # (batch_size, 1, feature_dim)
+        return out.squeeze(1)
 
 if __name__ == "__main__":
     input_dim = 512
     hidden_dim = 128
     # MILPooling = AttentionBasedMILPooling(input_dim, hidden_dim)
     MILPooling = GatedAttentionBasedMILPooling(input_dim, hidden_dim)
-    x = torch.randn((16, 512))
+    x = torch.randn(4, 16, 512)
     bag_embed = MILPooling(x)
     print(bag_embed.shape)
     print(bag_embed[:, :10])
