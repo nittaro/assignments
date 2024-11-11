@@ -50,11 +50,11 @@ class ModifiedMSA(nn.Module):
 
             Q_f = Q[:, :, :num_k*segs, :].reshape(batch_size, self.num_heads, num_k, segs, self.head_dim).mean(-2)
             Q_l = Q[:, :, num_k*segs:, :].reshape(batch_size, self.num_heads, r, segs+1, self.head_dim).mean(-2)
-            Q_tilde = torch.concat((Q_f, Q_l), dim=-2)
+            Q_tilde = torch.cat((Q_f, Q_l), dim=-2)
 
             K_f = K[:, :, :num_k*segs, :].reshape(batch_size, self.num_heads, num_k, segs, self.head_dim).mean(-2)
             K_l = K[:, :, num_k*segs:, :].reshape(batch_size, self.num_heads, r, segs+1, self.head_dim).mean(-2)
-            K_tilde = torch.concat((K_f, K_l), dim=-2)
+            K_tilde = torch.cat((K_f, K_l), dim=-2)
 
         # Nyström approximation
         kernel1 = F.softmax(torch.matmul(Q, K_tilde.transpose(-1, -2)), dim=-1)
@@ -74,9 +74,9 @@ class PPEG(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
         self.embed_dim = embed_dim
-        self.Conv1 = nn.Conv2d(embed_dim, embed_dim, 3, padding=1)
-        self.Conv2 = nn.Conv2d(embed_dim, embed_dim, 5, padding=2)
-        self.Conv3 = nn.Conv2d(embed_dim, embed_dim, 7, padding=3)
+        self.Conv1 = nn.Conv2d(embed_dim, embed_dim, 3, padding=1, groups=embed_dim)
+        self.Conv2 = nn.Conv2d(embed_dim, embed_dim, 5, padding=2, groups=embed_dim)
+        self.Conv3 = nn.Conv2d(embed_dim, embed_dim, 7, padding=3, groups=embed_dim)
 
     def forward(self, x):
         # x : (B, N + 1, D)
@@ -95,7 +95,7 @@ class PPEG(nn.Module):
         H_F = torch.permute(H_F, (0, 2, 3, 1)) # (B, N_sqrt, N_sqrt, D)
         H_se = torch.reshape(H_F, (-1, N, self.embed_dim)) # (B, N, D)
 
-        return torch.concat((H_c, H_se), dim=1)
+        return torch.cat((H_c, H_se), dim=1)
 
 class TPTModule(nn.Module):
     def __init__(self,embed_dim, num_heads):
@@ -167,7 +167,7 @@ class TransMIL(nn.Module):
 if __name__ == "__main__":
     embed_dim = 1000
     num_heads = 10
-    num_layers = 3
+    num_layers = 1
     num_patches = 256
     num_classes = 10
     num_channels = 3
