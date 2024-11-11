@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from nystrom_attention import NystromAttention
 
 class NysAttention(nn.Module):
     def __init__(self, dim, num_heads=8, num_landmarks=64):
@@ -167,12 +168,14 @@ class MSA(nn.Module):
 if __name__ == "__main__":
     embed_dim = 1024
     num_heads=8
-    num_patches = 256
+    num_patches = 300
+    num_landmarks=64
 
-    model1 = NysAttention(embed_dim, num_heads=num_heads)
-    model2 = ModifiedMSA(embed_dim, num_heads=num_heads)
-    model3 = MSA(embed_dim, num_heads=num_heads)
-    model4 = nn.MultiheadAttention(embed_dim, num_heads, bias=False, batch_first=True)
+    model1 = NysAttention(embed_dim, num_heads=num_heads, num_landmarks=num_landmarks)
+    model2 = ModifiedMSA(embed_dim, num_heads=num_heads, num_landmarks=num_landmarks)
+    model3 = NystromAttention(dim=embed_dim, dim_head=128, heads=num_heads, num_landmarks=num_landmarks, residual=False)
+    model4 = MSA(embed_dim, num_heads=num_heads)
+    model5 = nn.MultiheadAttention(embed_dim, num_heads, bias=False, batch_first=True)
 
     weight_qkv = torch.randn(3*embed_dim, embed_dim)
     weight_proj = torch.randn(embed_dim, embed_dim)
@@ -181,17 +184,22 @@ if __name__ == "__main__":
     model1.proj.weight = nn.Parameter(weight_proj.clone().detach())
     model2.proj_qkv.weight = nn.Parameter(weight_qkv.clone().detach())
     model2.proj_o.weight = nn.Parameter(weight_proj.clone().detach())
-    model3.proj_qkv.weight = nn.Parameter(weight_qkv.clone().detach())
-    model3.proj_o.weight = nn.Parameter(weight_proj.clone().detach())
-    model4.in_proj_weight = nn.Parameter(weight_qkv.clone().detach())
-    model4.out_proj.weight = nn.Parameter(weight_proj.clone().detach())
+    model3.to_qkv.weight = nn.Parameter(weight_qkv.clone().detach())
+    model3.to_out[0].weight = nn.Parameter(weight_proj.clone().detach())
+    model3.to_out[0].bias = nn.Parameter(torch.zeros(embed_dim))
+    model4.proj_qkv.weight = nn.Parameter(weight_qkv.clone().detach())
+    model4.proj_o.weight = nn.Parameter(weight_proj.clone().detach())
+    model5.in_proj_weight = nn.Parameter(weight_qkv.clone().detach())
+    model5.out_proj.weight = nn.Parameter(weight_proj.clone().detach())
 
     x = torch.randn(5, num_patches, embed_dim)
     out1 = model1(x)
     out2 = model2(x)
     out3 = model3(x)
-    out4, _ = model4(x, x, x)
-    print(out1[0, 0, :10])
-    print(out2[0, 0, :10])
-    print(out3[0, 0, :10])
-    print(out4[0, 0, :10])
+    out4 = model4(x)
+    out5, _ = model5(x, x, x)
+    print(out1[0, 0, :5])
+    print(out2[0, 0, :5])
+    print(out3[0, 0, :5])
+    print(out4[0, 0, :5])
+    print(out5[0, 0, :5])
