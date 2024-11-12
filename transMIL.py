@@ -1,8 +1,97 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
+from nystrom_attention import NystromAttention
 from torchvision import models
 from math import sqrt, isqrt
+
+
+class TransLayer(nn.Module):
+
+    def __init__(self, norm_layer=nn.LayerNorm, dim=512):
+        super().__init__()
+        self.norm = norm_layer(dim)
+        self.attn = NystromAttention(
+            dim = dim,
+            dim_head = dim//8,
+            heads = 8,
+            num_landmarks = 64,    # number of landmarks
+            pinv_iterations = 6,    # number of moore-penrose iterations for approximating pinverse. 6 was recommended by the paper
+            residual = False,         # whether to do an extra residual with the value or not. supposedly faster convergence if turned on
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.norm(x))
+
+        return x
+
+
+class PPEG(nn.Module):
+    def __init__(self, dim=512):
+        super(PPEG, self).__init__()
+        self.proj = nn.Conv2d(dim, dim, 7, 1, 7//2, groups=dim)
+        self.proj1 = nn.Conv2d(dim, dim, 5, 1, 5//2, groups=dim)
+        self.proj2 = nn.Conv2d(dim, dim, 3, 1, 3//2, groups=dim)
+
+    def forward(self, x, H, W):
+        B, _, C = x.shape
+        cls_token, feat_token = x[:, 0], x[:, 1:]
+        cnn_feat = feat_token.transpose(1, 2).view(B, C, H, W)
+        x = self.proj(cnn_feat)+cnn_feat+self.proj1(cnn_feat)+self.proj2(cnn_feat)
+        x = x.flatten(2).transpose(1, 2)
+        x = torch.cat((cls_token.unsqueeze(1), x), dim=1)
+        return x
+
+
+class TransMIL(nn.Module):
+    def __init__(self, n_classes):
+        super(TransMIL, self).__init__()
+        self.pos_layer = PPEG(dim=512)
+        self._fc1 = nn.Sequential(nn.Linear(1024, 512), nn.ReLU())
+        self.cls_token = nn.Parameter(torch.randn(1, 1, 512))
+        self.n_classes = n_classes
+        self.layer1 = TransLayer(dim=512)
+        self.layer2 = TransLayer(dim=512)
+        self.norm = nn.LayerNorm(512)
+        self._fc2 = nn.Linear(512, self.n_classes)
+
+
+    def forward(self, x):
+
+        h = x.float() #[B, n, 1024]
+
+        h = self._fc1(h) #[B, n, 512]
+
+        #---->pad
+        H = h.shape[1]
+        _H, _W = int(np.ceil(np.sqrt(H))), int(np.ceil(np.sqrt(H)))
+        add_length = _H * _W - H
+        h = torch.cat([h, h[:,:add_length,:]],dim = 1) #[B, N, 512]
+
+        #---->cls_token
+        B = h.shape[0]
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        h = torch.cat((cls_tokens, h), dim=1)
+
+        #---->Translayer x1
+        h = self.layer1(h) #[B, N, 512]
+
+        #---->PPEG
+        h = self.pos_layer(h, _H, _W) #[B, N, 512]
+
+        #---->Translayer x2
+        h = self.layer2(h) #[B, N, 512]
+
+        #---->cls_token
+        h = self.norm(h)[:,0]
+
+        #---->predict
+        logits = self._fc2(h) #[B, n_classes]
+        Y_hat = torch.argmax(logits, dim=1)
+        Y_prob = F.softmax(logits, dim = 1)
+        results_dict = {'logits': logits, 'Y_prob': Y_prob, 'Y_hat': Y_hat}
+        return results_dict
 
 # Nyström Method is used in the calculation of attention weight
 class ModifiedMSA(nn.Module):
@@ -70,7 +159,7 @@ class ModifiedMSA(nn.Module):
 
         return out
 
-class PPEG(nn.Module):
+class NittaPPEG(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
         self.embed_dim = embed_dim
@@ -80,20 +169,19 @@ class PPEG(nn.Module):
 
     def forward(self, x):
         # x : (B, N + 1, D)
-        N = x.size()[1] - 1
+        N = x.size(1) - 1
         N_sqrt = int(sqrt(N))
         assert N_sqrt * N_sqrt == N
 
         H_c = x[:, :1, :] # (B, 1, D)
         H_f = x[:, 1:, :] # (B, N, D)
-        H_f = torch.reshape(H_f, (-1, N_sqrt, N_sqrt, self.embed_dim))
-        H_f = torch.permute(H_f, (0, 3, 1, 2)) # (B, D, N_sqrt, N_sqrt)
+        H_f = torch.transpose(H_f, 1, 2).reshape(-1, self.embed_dim, N_sqrt, N_sqrt)
         H_1 = self.Conv1(H_f)
         H_2 = self.Conv2(H_f)
         H_3 = self.Conv3(H_f)
         H_F = H_f + H_1 + H_2 + H_3
-        H_F = torch.permute(H_F, (0, 2, 3, 1)) # (B, N_sqrt, N_sqrt, D)
-        H_se = torch.reshape(H_F, (-1, N, self.embed_dim)) # (B, N, D)
+        H_F = H_F.reshape(-1, self.embed_dim, N)
+        H_se = torch.transpose(H_F, 1, 2) # (B, N, D)
 
         return torch.cat((H_c, H_se), dim=1)
 
@@ -107,28 +195,51 @@ class TPTModule(nn.Module):
         self.LN2 = nn.LayerNorm(embed_dim)
         self.MSA1 = ModifiedMSA(embed_dim, num_heads)
         self.MSA2 = ModifiedMSA(embed_dim, num_heads)
-        self.PPEG = PPEG(embed_dim)
+        self.PPEG = NittaPPEG(embed_dim)
+
+        """
+        self.attn1 = NystromAttention(
+            dim = embed_dim,
+            dim_head = embed_dim//8,
+            heads = 8,
+            num_landmarks = 64,
+            pinv_iterations = 6,
+            residual = False,
+        )
+
+        self.attn2 = NystromAttention(
+            dim = embed_dim,
+            dim_head = embed_dim//8,
+            heads = 8,
+            num_landmarks = 64,
+            pinv_iterations = 6,
+            residual = False,
+        )
+        """
+
 
     def forward(self, x):
         x = self.MSA1(self.LN1(x)) + x
         x = self.PPEG(x)
         x = self.MSA2(self.LN2(x)) + x
-
         return x
 
-class TransMIL(nn.Module):
-    def __init__(self, num_heads, num_layers, num_classes, embed_dim=1000):
+class NittaTransMIL(nn.Module):
+    def __init__(self, num_heads, num_layers, num_classes, embed_dim=512):
         super().__init__()
 
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.num_classes = num_classes
 
+        """
         self.resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
         if embed_dim != 1000:
             self.resnet.fc = nn.Linear(2048, embed_dim)
+        """
 
-        self.cls_token = nn.Parameter(torch.randn(1, embed_dim))
+        self.fc = nn.Sequential(nn.Linear(1024, 512), nn.ReLU())
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
 
         self.encoder = nn.Sequential(*[
             TPTModule(embed_dim, num_heads)
@@ -141,20 +252,24 @@ class TransMIL(nn.Module):
         )
 
     def forward(self, x):
-        # x : (B, N, C, H, W)
-        B, n, channels, height, width = x.size()
+        # x : (B, n, D)
+        x = self.fc(x)
+        B, n, D = x.size()
         N_sqrt = isqrt(n - 1) + 1
         N = N_sqrt * N_sqrt
         M = N - n
 
+        """
         # feature embedding
         with torch.no_grad():
             x = torch.flatten(x, end_dim=1)
             H = self.resnet(x) # (B * N, D)
             H = torch.reshape(H, (B, n, -1))
+        """
 
         # squaring of sequence
-        H_s = torch.cat((self.cls_token.repeat(repeats=(B, 1, 1)), H, H[:, :M, :]), dim=1)
+        # H_s = torch.cat((self.cls_token.repeat(repeats=(B, 1, 1)), H, H[:, :M, :]), dim=1)
+        H_s = torch.cat((self.cls_token.repeat(repeats=(B, 1, 1)), x, x[:, :M, :]), dim=1)
 
         # TPT module processing
         H_s = self.encoder(H_s)
@@ -164,34 +279,132 @@ class TransMIL(nn.Module):
 
         return Y
 
+
 if __name__ == "__main__":
-    embed_dim = 1000
-    num_heads = 10
+    embed_dim = 512
+    num_heads = 8
     num_layers = 1
     num_patches = 256
     num_classes = 10
-    num_channels = 3
-    height = 224
-    width = 224
 
     """
-    # test code for PPEG
-    ppeg = PPEG(embed_dim)
-    x = torch.rand(1, 26, 1000)
-    out = ppeg(x)
-    print(out[0])
+    ppeg1 = PPEG(embed_dim)
+    ppeg2 = NittaPPEG(embed_dim)
+
+    weight_conv1 = torch.randn(embed_dim, 1, 3, 3)
+    weight_conv2 = torch.randn(embed_dim, 1, 5, 5)
+    weight_conv3 = torch.randn(embed_dim, 1, 7, 7)
+    bias_conv1 = torch.randn(embed_dim)
+    bias_conv2 = torch.randn(embed_dim)
+    bias_conv3 = torch.randn(embed_dim)
+
+    ppeg1.proj.weight = nn.Parameter(weight_conv3.clone().detach())
+    ppeg1.proj.bias = nn.Parameter(bias_conv3.clone().detach())
+    ppeg1.proj1.weight = nn.Parameter(weight_conv2.clone().detach())
+    ppeg1.proj1.bias = nn.Parameter(bias_conv2.clone().detach())
+    ppeg1.proj2.weight = nn.Parameter(weight_conv1.clone().detach())
+    ppeg1.proj2.bias = nn.Parameter(bias_conv1.clone().detach())
+    ppeg2.Conv1.weight = nn.Parameter(weight_conv1.clone().detach())
+    ppeg2.Conv1.bias = nn.Parameter(bias_conv1.clone().detach())
+    ppeg2.Conv2.weight = nn.Parameter(weight_conv2.clone().detach())
+    ppeg2.Conv2.bias = nn.Parameter(bias_conv2.clone().detach())
+    ppeg2.Conv3.weight = nn.Parameter(weight_conv3.clone().detach())
+    ppeg2.Conv3.bias = nn.Parameter(bias_conv3.clone().detach())
+
+    x = torch.rand(1, num_patches+1, embed_dim)
+    out1 = ppeg1(x, 16, 16)
+    out2 = ppeg2(x)
+    print(out1[0])
+    print(out2[0])
     """
 
+
+    x = torch.randn(1, num_patches, embed_dim*2)
+    model1 = NittaTransMIL(num_heads, num_layers, num_classes)
+    model2 = TransMIL(n_classes=num_classes)
+
+    cls_token = torch.randn(1, 1, embed_dim)
+    weight_fc = torch.randn(embed_dim, embed_dim*2)
+    bias_fc = torch.randn(embed_dim)
+    weight_LN1 = torch.randn(embed_dim)
+    bias_LN1 = torch.randn(embed_dim)
+    weight_LN2 = torch.randn(embed_dim)
+    bias_LN2 = torch.randn(embed_dim)
+    weight_qkv_1 = torch.randn(embed_dim*3, embed_dim)
+    weight_proj_1 = torch.randn(embed_dim, embed_dim)
+    bias_proj_1 = torch.randn(embed_dim)
+    weight_qkv_2 = torch.randn(embed_dim*3, embed_dim)
+    weight_proj_2 = torch.randn(embed_dim, embed_dim)
+    bias_proj_2 = torch.randn(embed_dim)
+    weight_conv1 = torch.randn(embed_dim, 1, 3, 3)
+    weight_conv2 = torch.randn(embed_dim, 1, 5, 5)
+    weight_conv3 = torch.randn(embed_dim, 1, 7, 7)
+    bias_conv1 = torch.randn(embed_dim)
+    bias_conv2 = torch.randn(embed_dim)
+    bias_conv3 = torch.randn(embed_dim)
+    weight_mlp_norm = torch.randn(embed_dim)
+    bias_mlp_norm = torch.randn(embed_dim)
+    weight_mlp_fc = torch.randn(num_classes, embed_dim)
+    bias_mlp_fc = torch.randn(num_classes)
+
+    model1.cls_token = nn.Parameter(cls_token.clone().detach())
+    model1.fc[0].weight = nn.Parameter(weight_fc.clone().detach())
+    model1.fc[0].bias = nn.Parameter(bias_fc.clone().detach())
+    model1.encoder[0].MSA1.proj_qkv.weight = nn.Parameter(weight_qkv_1.clone().detach())
+    model1.encoder[0].MSA1.proj_o.weight = nn.Parameter(weight_proj_1.clone().detach())
+    model1.encoder[0].MSA1.proj_o.bias = nn.Parameter(bias_proj_1.clone().detach())
+    model1.encoder[0].MSA2.proj_qkv.weight = nn.Parameter(weight_qkv_2.clone().detach())
+    model1.encoder[0].MSA2.proj_o.weight = nn.Parameter(weight_proj_2.clone().detach())
+    model1.encoder[0].MSA2.proj_o.bias = nn.Parameter(bias_proj_2.clone().detach())
+    model1.encoder[0].LN1.weight = nn.Parameter(weight_LN1.clone().detach())
+    model1.encoder[0].LN1.bias = nn.Parameter(bias_LN1.clone().detach())
+    model1.encoder[0].LN2.weight = nn.Parameter(weight_LN2.clone().detach())
+    model1.encoder[0].LN2.bias = nn.Parameter(bias_LN2.clone().detach())
+    model1.encoder[0].PPEG.Conv1.weight = nn.Parameter(weight_conv1.clone().detach())
+    model1.encoder[0].PPEG.Conv2.weight = nn.Parameter(weight_conv2.clone().detach())
+    model1.encoder[0].PPEG.Conv3.weight = nn.Parameter(weight_conv3.clone().detach())
+    model1.encoder[0].PPEG.Conv1.bias = nn.Parameter(bias_conv1.clone().detach())
+    model1.encoder[0].PPEG.Conv2.bias = nn.Parameter(bias_conv2.clone().detach())
+    model1.encoder[0].PPEG.Conv3.bias = nn.Parameter(bias_conv3.clone().detach())
+    model1.mlp_head[0].weight = nn.Parameter(weight_mlp_norm.clone().detach())
+    model1.mlp_head[0].bias = nn.Parameter(bias_mlp_norm.clone().detach())
+    model1.mlp_head[1].weight = nn.Parameter(weight_mlp_fc.clone().detach())
+    model1.mlp_head[1].bias = nn.Parameter(bias_mlp_fc.clone().detach())
+
     """
-    # test code for Nyström approximation
-    msa = ModifiedMSA(embed_dim, num_heads)
-    x = torch.rand(1, 256, 1000)
-    out = msa(x)
-    print(out[0])
+    model1.encoder[0].attn1.to_qkv.weight = nn.Parameter(weight_qkv_1.clone().detach())
+    model1.encoder[0].attn1.to_out[0].weight = nn.Parameter(weight_proj_1.clone().detach())
+    model1.encoder[0].attn1.to_out[0].bias = nn.Parameter(bias_proj_1.clone().detach())
+    model1.encoder[0].attn2.to_qkv.weight = nn.Parameter(weight_qkv_2.clone().detach())
+    model1.encoder[0].attn2.to_out[0].weight = nn.Parameter(weight_proj_2.clone().detach())
+    model1.encoder[0].attn2.to_out[0].bias = nn.Parameter(bias_proj_2.clone().detach())
     """
 
-    # test code for TransMIL
-    x = torch.rand(1, num_patches, num_channels, height, width)
-    model = TransMIL(num_heads, num_layers, num_classes)
-    pred = model(x)
-    print(pred)
+    model2.cls_token = nn.Parameter(cls_token.clone().detach())
+    model2.pos_layer.proj.weight = nn.Parameter(weight_conv3.clone().detach())
+    model2.pos_layer.proj.bias = nn.Parameter(bias_conv3.clone().detach())
+    model2.pos_layer.proj1.weight = nn.Parameter(weight_conv2.clone().detach())
+    model2.pos_layer.proj1.bias = nn.Parameter(bias_conv2.clone().detach())
+    model2.pos_layer.proj2.weight = nn.Parameter(weight_conv1.clone().detach())
+    model2.pos_layer.proj2.bias = nn.Parameter(bias_conv1.clone().detach())
+    model2._fc1[0].weight = nn.Parameter(weight_fc.clone().detach())
+    model2._fc1[0].bias = nn.Parameter(bias_fc.clone().detach())
+    model2.layer1.norm.weight = nn.Parameter(weight_LN1.clone().detach())
+    model2.layer1.norm.bias = nn.Parameter(bias_LN1.clone().detach())
+    model2.layer2.norm.weight = nn.Parameter(weight_LN2.clone().detach())
+    model2.layer2.norm.bias = nn.Parameter(bias_LN2.clone().detach())
+    model2.layer1.attn.to_qkv.weight = nn.Parameter(weight_qkv_1.clone().detach())
+    model2.layer1.attn.to_out[0].weight = nn.Parameter(weight_proj_1.clone().detach())
+    model2.layer1.attn.to_out[0].bias = nn.Parameter(bias_proj_1.clone().detach())
+    model2.layer2.attn.to_qkv.weight = nn.Parameter(weight_qkv_2.clone().detach())
+    model2.layer2.attn.to_out[0].weight = nn.Parameter(weight_proj_2.clone().detach())
+    model2.layer2.attn.to_out[0].bias = nn.Parameter(bias_proj_2.clone().detach())
+    model2.norm.weight = nn.Parameter(weight_mlp_norm.clone().detach())
+    model2.norm.bias = nn.Parameter(bias_mlp_norm.clone().detach())
+    model2._fc2.weight = nn.Parameter(weight_mlp_fc.clone().detach())
+    model2._fc2.bias = nn.Parameter(bias_mlp_fc.clone().detach())
+
+    out1 = model1(x)
+    out2 = model2(x)
+    print(out1)
+    print(out2['logits'])
