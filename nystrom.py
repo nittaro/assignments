@@ -4,15 +4,28 @@ import torch.nn.functional as F
 from nystrom_attention import NystromAttention
 
 class NysAttention(nn.Module):
-    def __init__(self, dim, num_heads=8, num_landmarks=64):
+    def __init__(self, embed_dim, num_heads=8, num_landmarks=64, qkv_bias=False, attn_drop=0., proj_drop=0., kernel_size=0):
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        self.head_dim = embed_dim // num_heads
         self.scale = self.head_dim ** 0.5
-        self.landmarks = num_landmarks
+        self.num_landmarks = num_landmarks
+        self.kernel_size = kernel_size
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.proj = nn.Linear(dim, dim, bias=True)
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
+        self.proj = nn.Linear(embed_dim, embed_dim, bias=True)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        if self.kernel_size > 0:
+            self.conv = nn.Conv2d(
+                in_channels = self.num_heads,
+                out_channels = self.num_heads,
+                kernel_size = (self.kernel_size, 1),
+                padding = (self.kernel_size // 2, 0),
+                bias = False,
+                groups = self.num_heads,
+            )
 
     def iterative_inv(self, mat, n_iter = 6):
         I = torch.eye(mat.size(-1), device = mat.device)
@@ -28,33 +41,37 @@ class NysAttention(nn.Module):
 
     def forward(self, x):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        q /= self.scale
+        QKV = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        Q, K, V = QKV[0], QKV[1], QKV[2]
+        Q /= self.scale
 
-        keys_head_dim = k.size(-1)
-        segs = N // self.landmarks
-        if (N % self.landmarks == 0):
-            keys_landmarks = k.reshape(B, self.num_heads, self.landmarks, N // self.landmarks, keys_head_dim).mean(dim = -2)
-            queries_landmarks = q.reshape(B, self.num_heads, self.landmarks, N // self.landmarks, keys_head_dim).mean(dim = -2)
+        segs = N // self.num_landmarks
+        if (N % self.num_landmarks == 0):
+            K_landmarks = K.reshape(B, self.num_heads, self.num_landmarks, N // self.num_landmarks, self.head_dim).mean(dim=-2)
+            Q_landmarks = Q.reshape(B, self.num_heads, self.num_landmarks, N // self.num_landmarks, self.head_dim).mean(dim=-2)
         else:
-            num_k = (segs + 1) * self.landmarks - N
-            keys_landmarks_f = k[:, :, :num_k * segs, :].reshape(B, self.num_heads, num_k, segs, keys_head_dim).mean(dim = -2)
-            keys_landmarks_l = k[:, :, num_k * segs:, :].reshape(B, self.num_heads, self.landmarks - num_k, segs + 1, keys_head_dim).mean(dim = -2)
-            keys_landmarks = torch.cat((keys_landmarks_f, keys_landmarks_l), dim = -2)
+            num_k = (segs + 1) * self.num_landmarks - N
+            K_landmarks_f = K[:, :, :num_k * segs, :].reshape(B, self.num_heads, num_k, segs, self.head_dim).mean(dim=-2)
+            K_landmarks_l = K[:, :, num_k * segs:, :].reshape(B, self.num_heads, self.num_landmarks - num_k, segs + 1, self.head_dim).mean(dim=-2)
+            K_landmarks = torch.cat((K_landmarks_f, K_landmarks_l), dim=-2)
 
-            queries_landmarks_f = q[:, :, :num_k * segs, :].reshape(B, self.num_heads, num_k, segs, keys_head_dim).mean(dim = -2)
-            queries_landmarks_l = q[:, :, num_k * segs:, :].reshape(B, self.num_heads, self.landmarks - num_k, segs + 1, keys_head_dim).mean(dim = -2)
-            queries_landmarks = torch.cat((queries_landmarks_f, queries_landmarks_l), dim = -2)
+            Q_landmarks_f = Q[:, :, :num_k * segs, :].reshape(B, self.num_heads, num_k, segs, self.head_dim).mean(dim=-2)
+            Q_landmarks_l = Q[:, :, num_k * segs:, :].reshape(B, self.num_heads, self.num_landmarks - num_k, segs + 1, self.head_dim).mean(dim=-2)
+            Q_landmarks = torch.cat((Q_landmarks_f, Q_landmarks_l), dim=-2)
 
-        kernel_1 = torch.nn.functional.softmax(torch.matmul(q, keys_landmarks.transpose(-1, -2)), dim = -1)
-        kernel_2 = torch.nn.functional.softmax(torch.matmul(queries_landmarks, keys_landmarks.transpose(-1, -2)), dim = -1)
-        kernel_3 = torch.nn.functional.softmax(torch.matmul(queries_landmarks, k.transpose(-1, -2)), dim = -1)
+        kernel1 = torch.nn.functional.softmax(torch.matmul(Q, K_landmarks.transpose(-1, -2)), dim=-1)
+        kernel2 = torch.nn.functional.softmax(torch.matmul(Q_landmarks, K_landmarks.transpose(-1, -2)), dim=-1)
+        kernel3 = torch.nn.functional.softmax(torch.matmul(Q_landmarks, K.transpose(-1, -2)), dim=-1)
 
-        out = torch.matmul(torch.matmul(kernel_1, self.iterative_inv(kernel_2)), torch.matmul(kernel_3, v))
+        SV = torch.matmul(torch.matmul(kernel1, self.iterative_inv(kernel2)), torch.matmul(kernel3, V))
 
-        out = out.transpose(1, 2).reshape(B, N, -1)
-        out = self.proj(out)
+        if self.kernel_size > 0:
+            SV += self.conv(V)
+
+        SV = SV.transpose(1, 2).reshape(B, N, -1)
+        out = self.proj(SV)
+        out = self.proj_drop(out)
+        out += V.transpose(1, 2).reshape(B, N, -1)
 
         return out
 
