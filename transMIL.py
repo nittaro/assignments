@@ -5,10 +5,13 @@ import numpy as np
 from nystrom_attention import NystromAttention
 from torchvision import models
 from math import sqrt, isqrt
+import timm
+from timm.data import resolve_data_config
+from timm.data.transforms_factory import create_transform
+import time
 
 
 class TransLayer(nn.Module):
-
     def __init__(self, norm_layer=nn.LayerNorm, dim=512):
         super().__init__()
         self.norm = norm_layer(dim)
@@ -26,7 +29,6 @@ class TransLayer(nn.Module):
 
         return x
 
-
 class PPEG(nn.Module):
     def __init__(self, dim=512):
         super(PPEG, self).__init__()
@@ -42,7 +44,6 @@ class PPEG(nn.Module):
         x = x.flatten(2).transpose(1, 2)
         x = torch.cat((cls_token.unsqueeze(1), x), dim=1)
         return x
-
 
 class TransMIL(nn.Module):
     def __init__(self, n_classes):
@@ -159,6 +160,86 @@ class ModifiedMSA(nn.Module):
 
         return out
 
+class NysAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads=8, num_landmarks=64, qkv_bias=False, proj_drop=0., kernel_size=0):
+        super().__init__()
+
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** 0.5
+        self.num_landmarks = num_landmarks
+        self.kernel_size = kernel_size
+
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
+        self.proj = nn.Linear(embed_dim, embed_dim, bias=True)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        if self.kernel_size > 0:
+            self.conv = nn.Conv2d(
+                in_channels = self.num_heads,
+                out_channels = self.num_heads,
+                kernel_size = (self.kernel_size, 1),
+                padding = (self.kernel_size // 2, 0),
+                bias = False,
+                groups = self.num_heads,
+            )
+
+    def iterative_inv(self, mat, n_iter = 6):
+        I = torch.eye(mat.size(-1), device = mat.device)
+        K = mat
+
+        V = 1 / torch.max(torch.sum(K, dim = -2), dim = -1).values[:, :, None, None] * K.transpose(-1, -2)
+
+        for _ in range(n_iter):
+            KV = torch.matmul(K, V)
+            V = torch.matmul(0.25 * V, 13 * I - torch.matmul(KV, 15 * I - torch.matmul(KV, 7 * I - KV)))
+        return V
+
+    def forward(self, x):
+        B, N, C = x.shape
+        assert self.num_landmarks < N
+
+        QKV = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        Q, K, V = QKV[0], QKV[1], QKV[2]
+        Q /= self.scale
+
+        segs = N // self.num_landmarks
+        r = N % self.num_landmarks
+        assert segs != 0
+
+        if r == 0:
+            K_landmarks = K.reshape(B, self.num_heads, self.num_landmarks, segs, self.head_dim).mean(dim=-2)
+            Q_landmarks = Q.reshape(B, self.num_heads, self.num_landmarks, segs, self.head_dim).mean(dim=-2)
+        else:
+            num_k = self.num_landmarks - r
+
+            K_landmarks_f = K[:, :, :num_k * segs, :].reshape(B, self.num_heads, num_k, segs, self.head_dim).mean(dim=-2)
+            K_landmarks_l = K[:, :, num_k * segs:, :].reshape(B, self.num_heads, r, segs + 1, self.head_dim).mean(dim=-2)
+            K_landmarks = torch.cat((K_landmarks_f, K_landmarks_l), dim=-2)
+
+            Q_landmarks_f = Q[:, :, :num_k * segs, :].reshape(B, self.num_heads, num_k, segs, self.head_dim).mean(dim=-2)
+            Q_landmarks_l = Q[:, :, num_k * segs:, :].reshape(B, self.num_heads, r, segs + 1, self.head_dim).mean(dim=-2)
+            Q_landmarks = torch.cat((Q_landmarks_f, Q_landmarks_l), dim=-2)
+
+        kernel1 = torch.nn.functional.softmax(torch.matmul(Q, K_landmarks.transpose(-1, -2)), dim=-1)
+        kernel2 = torch.nn.functional.softmax(torch.matmul(Q_landmarks, K_landmarks.transpose(-1, -2)), dim=-1)
+        kernel3 = torch.nn.functional.softmax(torch.matmul(Q_landmarks, K.transpose(-1, -2)), dim=-1)
+
+        SV = torch.matmul(torch.matmul(kernel1, self.iterative_inv(kernel2)), torch.matmul(kernel3, V))
+        # another way to calculate Moore-Penrose inverse of a matrix
+        # S = torch.matmul(kernel_1, torch.linalg.lstsq(kernel_2, kernel_3).solution)
+        # SV = torch.matmul(S, V)
+
+        if self.kernel_size > 0:
+            SV += self.conv(V)
+
+        SV = SV.transpose(1, 2).reshape(B, N, -1)
+        out = self.proj(SV)
+        out = self.proj_drop(out)
+        out += V.transpose(1, 2).reshape(B, N, -1)
+
+        return out
+
 class NittaPPEG(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
@@ -193,35 +274,26 @@ class TPTModule(nn.Module):
         self.num_heads = num_heads
         self.LN1 = nn.LayerNorm(embed_dim)
         self.LN2 = nn.LayerNorm(embed_dim)
+        """
         self.MSA1 = ModifiedMSA(embed_dim, num_heads)
         self.MSA2 = ModifiedMSA(embed_dim, num_heads)
+        """
         self.PPEG = NittaPPEG(embed_dim)
-
-        """
-        self.attn1 = NystromAttention(
-            dim = embed_dim,
-            dim_head = embed_dim//8,
-            heads = 8,
-            num_landmarks = 64,
-            pinv_iterations = 6,
-            residual = False,
-        )
-
-        self.attn2 = NystromAttention(
-            dim = embed_dim,
-            dim_head = embed_dim//8,
-            heads = 8,
-            num_landmarks = 64,
-            pinv_iterations = 6,
-            residual = False,
-        )
-        """
+        self.attn1 = NysAttention(embed_dim)
+        self.attn2 = NysAttention(embed_dim)
 
 
     def forward(self, x):
+        """
         x = self.MSA1(self.LN1(x)) + x
         x = self.PPEG(x)
         x = self.MSA2(self.LN2(x)) + x
+        return x
+        """
+
+        x = self.attn1(self.LN1(x)) + x
+        x = self.PPEG(x)
+        x = self.attn2(self.LN2(x)) + x
         return x
 
 class NittaTransMIL(nn.Module):
@@ -232,13 +304,11 @@ class NittaTransMIL(nn.Module):
         self.num_heads = num_heads
         self.num_classes = num_classes
 
-        """
-        self.resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-        if embed_dim != 1000:
-            self.resnet.fc = nn.Linear(2048, embed_dim)
-        """
+        self.feature_extractor = timm.create_model('resnet50', pretrained=True, num_classes=0)
+        config = resolve_data_config({}, model=self.feature_extractor)
+        self.transform = create_transform(**config)
 
-        self.fc = nn.Sequential(nn.Linear(1024, 512), nn.ReLU())
+        self.fc = nn.Sequential(nn.Linear(2048, embed_dim), nn.ReLU())
         self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
 
         self.encoder = nn.Sequential(*[
@@ -252,32 +322,34 @@ class NittaTransMIL(nn.Module):
         )
 
     def forward(self, x):
-        # x : (B, n, D)
-        x = self.fc(x)
-        B, n, D = x.size()
+        # feature embedding
+        B, n, _, _, _ = x.size()
+
+        with torch.no_grad():
+            x = torch.flatten(x, end_dim=1)
+            x = self.transform(x)
+            H = self.feature_extractor(x).reshape(B, n, -1)
+
+        # H : (B, n, D)
+        H = self.fc(H)
         N_sqrt = isqrt(n - 1) + 1
         N = N_sqrt * N_sqrt
         M = N - n
 
-        """
-        # feature embedding
-        with torch.no_grad():
-            x = torch.flatten(x, end_dim=1)
-            H = self.resnet(x) # (B * N, D)
-            H = torch.reshape(H, (B, n, -1))
-        """
-
         # squaring of sequence
-        # H_s = torch.cat((self.cls_token.repeat(repeats=(B, 1, 1)), H, H[:, :M, :]), dim=1)
-        H_s = torch.cat((self.cls_token.repeat(repeats=(B, 1, 1)), x, x[:, :M, :]), dim=1)
+        H_s = torch.cat((self.cls_token.repeat(repeats=(B, 1, 1)), H, H[:, :M, :]), dim=1)
+        # H_s = torch.cat((self.cls_token.repeat(repeats=(B, 1, 1)), x, x[:, :M, :]), dim=1)
 
         # TPT module processing
         H_s = self.encoder(H_s)
 
         # MLP
-        Y = self.mlp_head(H_s[:, 0])
+        logits = self.mlp_head(H_s[:, 0])
+        Y_hat = torch.argmax(logits, dim=1)
+        Y_prob = F.softmax(logits, dim=1)
+        ret = {'logits': logits, 'Y_prob': Y_prob, 'Y_hat': Y_hat}
 
-        return Y
+        return ret
 
 
 if __name__ == "__main__":
@@ -286,6 +358,7 @@ if __name__ == "__main__":
     num_layers = 1
     num_patches = 256
     num_classes = 10
+    num_landmarks = 64
 
     """
     ppeg1 = PPEG(embed_dim)
@@ -319,6 +392,7 @@ if __name__ == "__main__":
     """
 
 
+    """"
     x = torch.randn(1, num_patches, embed_dim*2)
     model1 = NittaTransMIL(num_heads, num_layers, num_classes)
     model2 = TransMIL(n_classes=num_classes)
@@ -350,12 +424,16 @@ if __name__ == "__main__":
     model1.cls_token = nn.Parameter(cls_token.clone().detach())
     model1.fc[0].weight = nn.Parameter(weight_fc.clone().detach())
     model1.fc[0].bias = nn.Parameter(bias_fc.clone().detach())
+    """
+    """
     model1.encoder[0].MSA1.proj_qkv.weight = nn.Parameter(weight_qkv_1.clone().detach())
     model1.encoder[0].MSA1.proj_o.weight = nn.Parameter(weight_proj_1.clone().detach())
     model1.encoder[0].MSA1.proj_o.bias = nn.Parameter(bias_proj_1.clone().detach())
     model1.encoder[0].MSA2.proj_qkv.weight = nn.Parameter(weight_qkv_2.clone().detach())
     model1.encoder[0].MSA2.proj_o.weight = nn.Parameter(weight_proj_2.clone().detach())
     model1.encoder[0].MSA2.proj_o.bias = nn.Parameter(bias_proj_2.clone().detach())
+    """
+    """
     model1.encoder[0].LN1.weight = nn.Parameter(weight_LN1.clone().detach())
     model1.encoder[0].LN1.bias = nn.Parameter(bias_LN1.clone().detach())
     model1.encoder[0].LN2.weight = nn.Parameter(weight_LN2.clone().detach())
@@ -371,14 +449,12 @@ if __name__ == "__main__":
     model1.mlp_head[1].weight = nn.Parameter(weight_mlp_fc.clone().detach())
     model1.mlp_head[1].bias = nn.Parameter(bias_mlp_fc.clone().detach())
 
-    """
     model1.encoder[0].attn1.to_qkv.weight = nn.Parameter(weight_qkv_1.clone().detach())
     model1.encoder[0].attn1.to_out[0].weight = nn.Parameter(weight_proj_1.clone().detach())
     model1.encoder[0].attn1.to_out[0].bias = nn.Parameter(bias_proj_1.clone().detach())
     model1.encoder[0].attn2.to_qkv.weight = nn.Parameter(weight_qkv_2.clone().detach())
     model1.encoder[0].attn2.to_out[0].weight = nn.Parameter(weight_proj_2.clone().detach())
     model1.encoder[0].attn2.to_out[0].bias = nn.Parameter(bias_proj_2.clone().detach())
-    """
 
     model2.cls_token = nn.Parameter(cls_token.clone().detach())
     model2.pos_layer.proj.weight = nn.Parameter(weight_conv3.clone().detach())
@@ -408,3 +484,12 @@ if __name__ == "__main__":
     out2 = model2(x)
     print(out1)
     print(out2['logits'])
+    """
+
+    x = torch.rand(1, num_patches, 3, 512, 512)
+    model = NittaTransMIL(num_heads, num_layers, num_classes)
+    start = time.perf_counter()
+    ret = model(x)
+    end = time.perf_counter()
+    print(ret)
+    print('{:.2f}'.format(end-start))
